@@ -1,0 +1,250 @@
+
+#requires -Version 5.1
+# ===========================
+# Flattened S3 copy with logs
+# ===========================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ---------------------------
+# Config (avoid hardcoding secrets if possible)
+# ---------------------------
+# NOTE: Prefer an AWS CLI profile (aws configure set ...; then use --profile) instead of env vars.
+# These env vars will be cleared at the end of this script for safety.
+$env:AWS_ACCESS_KEY_ID     = "AwsAccessKeyID1235"
+$env:AWS_SECRET_ACCESS_KEY = "RandomSecret12"
+# Optional region (uncomment if needed)
+# $env:AWS_DEFAULT_REGION = "eu-west-1"
+
+# Proxy (if required)
+$env:HTTPS_PROXY = "http://internalproxy.google.com:3128"
+$env:HTTP_PROXY  = "http://internalproxy.google.com:3128"
+
+#Prefice your $Bucket & $Prefix (AWS Location) 
+$Bucket = "On-prem-backups-uat"
+$Prefix = "AWS/mysqldump/"
+$Dest   = "F:\Dumps"
+
+# ---------------------------
+# Logging setup
+# ---------------------------
+$LogDir = Join-Path $Dest "logs"
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"
+$SuccessLog = Join-Path $LogDir "success_$ts.csv"
+$SkippedLog = Join-Path $LogDir "skipped_$ts.csv"
+$FailedLog  = Join-Path $LogDir "failed_$ts.csv"
+$Summary    = Join-Path $LogDir "summary_$ts.txt"
+
+# Ensure destination + log paths exist
+if (-not (Test-Path -LiteralPath $Dest))   { New-Item -ItemType Directory -Path $Dest  -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+# Create CSVs with headers (once)
+[PSCustomObject]@{ Timestamp=''; Key=''; LocalPath=''; Size=''; ETag='' } |
+  Export-Csv -Path $SuccessLog -NoTypeInformation -Force
+[PSCustomObject]@{ Timestamp=''; Key=''; LocalPath=''; Reason='' } |
+  Export-Csv -Path $SkippedLog -NoTypeInformation -Force
+[PSCustomObject]@{ Timestamp=''; Key=''; LocalPath=''; Error='' } |
+  Export-Csv -Path $FailedLog -NoTypeInformation -Force
+
+# ---------------------------
+# Pre-flight checks (aws cli + destination)
+# ---------------------------
+function Fail([string]$msg) { Write-Error $msg; exit 1 }
+
+# Check aws cli availability (works under SYSTEM too)
+$awsVersionOut = (& $env:ComSpec /c "aws --version 2>&1")
+if ($LASTEXITCODE -ne 0 -and [string]::IsNullOrWhiteSpace($awsVersionOut)) {
+    Fail "AWS CLI not found or not runnable by SYSTEM. Output: $awsVersionOut"
+}
+
+# Test destination write access
+try {
+    $testFile = Join-Path $Dest ".__write_test_$ts.tmp"
+    "test" | Out-File -FilePath $testFile -Encoding ASCII -Force
+    Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+} catch {
+    Fail "Destination '$Dest' not writable: $($_.Exception.Message)"
+}
+
+# ---------------------------
+# Get S3 object list (flatten target)
+# ---------------------------
+Write-Host "Listing objects under s3://$Bucket/$Prefix ..."
+
+# Use splatting to avoid fragile backticks
+$ListArgs = @{
+  bucket = $Bucket
+  prefix = $Prefix
+  query  = 'Contents[?ends_with(Key, `/`) == `false`].[Key,Size,ETag]'
+  output = 'json'
+}
+
+# Build the CLI command string safely
+$cmd = 'aws s3api list-objects-v2'
+$cmdLine = @(
+  $cmd,
+  "--bucket `"$($ListArgs.bucket)`"",
+  "--prefix `"$($ListArgs.prefix)`"",
+  "--query `"$($ListArgs.query)`"",
+  "--output $($ListArgs.output)"
+) -join ' '
+
+# Execute and capture both stdout and stderr
+$keysJson = & $env:ComSpec /c "$cmdLine 2>&1"
+$exitCode = $LASTEXITCODE
+
+if ($exitCode -ne 0) {
+  Write-Error "Failed to list objects. ExitCode=$exitCode. Output:`n$keysJson"
+  exit 1
+}
+
+try {
+  $keys = $keysJson | ConvertFrom-Json
+} catch {
+  Write-Error "Could not parse JSON from aws output. Raw output:`n$keysJson"
+  exit 1
+}
+
+if (-not $keys) {
+  Write-Warning "No objects found under s3://$Bucket/$Prefix"
+  # Produce summary and exit 0 (no work to do)
+  $lines = @(
+    "Run timestamp: $(Get-Date -Format s)",
+    "Bucket/Prefix: s3://$Bucket/$Prefix",
+    "Destination  : $Dest",
+    "Successes     : 0",
+    "Skipped       : 0",
+    "Failed/Missed : 0",
+    "Success log   : $SuccessLog",
+    "Skipped log   : $SkippedLog",
+    "Failed log    : $FailedLog"
+  )
+  $lines -join [Environment]::NewLine | Out-File -FilePath $Summary -Encoding UTF8
+  exit 0
+}
+
+[int]$copied  = 0
+[int]$skipped = 0
+[int]$failed  = 0
+
+# ---------------------------
+# Copy loop (flattened: use leaf file name)
+# ---------------------------
+foreach ($obj in $keys) {
+  # Handle array vs object shapes defensively
+  if ($obj -is [System.Array]) {
+    $key  = [string]$obj[0]
+    $size = [int64]$obj[1]
+    $etag = ([string]$obj[2]).Trim('"')
+  } else {
+    $key  = [string]$obj.Key
+    $size = [int64]$obj.Size
+    $etag = ([string]$obj.ETag).Trim('"')
+  }
+
+  if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+  $leaf  = Split-Path -Leaf $key
+  if ([string]::IsNullOrWhiteSpace($leaf)) { continue }
+
+  $local = Join-Path $Dest $leaf
+
+  # Collision policy: skip if local already exists
+  if (Test-Path -LiteralPath $local) {
+    $skipped++
+    [PSCustomObject]@{
+      Timestamp = (Get-Date).ToString("s")
+      Key       = $key
+      LocalPath = $local
+      Reason    = "Exists (collision)"
+    } | Export-Csv -Path $SkippedLog -NoTypeInformation -Append
+    continue
+  }
+
+  Write-Host "Copying s3://$Bucket/$key -> $local"
+  $copyCmdLine = "aws s3 cp `"s3://$Bucket/$key`" `"$local`" 2>&1"
+  $cmdOut = & $env:ComSpec /c $copyCmdLine
+  $copyExit = $LASTEXITCODE
+
+  if (($copyExit -eq 0) -and (Test-Path -LiteralPath $local)) {
+    # Optional: size verification
+    $sizeMismatch = $false
+    try {
+      $localSize = (Get-Item -LiteralPath $local).Length
+      if ($size -ge 0 -and $localSize -ne $size) {
+        $sizeMismatch = $true
+      }
+    } catch { }
+
+    if ($sizeMismatch) {
+      $failed++
+      Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue
+      [PSCustomObject]@{
+        Timestamp = (Get-Date).ToString("s")
+        Key       = $key
+        LocalPath = $local
+        Error     = "Size mismatch (S3=$size, Local=$localSize)"
+      } | Export-Csv -Path $FailedLog -NoTypeInformation -Append
+      continue
+    }
+
+    $copied++
+    [PSCustomObject]@{
+      Timestamp = (Get-Date).ToString("s")
+      Key       = $key
+      LocalPath = $local
+      Size      = $size
+      ETag      = $etag
+    } | Export-Csv -Path $SuccessLog -NoTypeInformation -Append
+  } else {
+    $failed++
+    $errText = ($cmdOut | Out-String).Trim()
+    if (-not $errText) { $errText = "aws s3 cp exited with code $copyExit" }
+    [PSCustomObject]@{
+      Timestamp = (Get-Date).ToString("s")
+      Key       = $key
+      LocalPath = $local
+      Error     = $errText
+    } | Export-Csv -Path $FailedLog -NoTypeInformation -Append
+  }
+}
+
+# ---------------------------
+# Summary
+# ---------------------------
+$lines = @()
+$lines += "Run timestamp: $(Get-Date -Format s)"
+$lines += "Bucket/Prefix: s3://$Bucket/$Prefix"
+$lines += "Destination  : $Dest"
+$lines += "Successes     : $copied"
+$lines += "Skipped       : $skipped"
+$lines += "Failed/Missed : $failed"
+$lines += "Success log   : $SuccessLog"
+$lines += "Skipped log   : $SkippedLog"
+$lines += "Failed log    : $FailedLog"
+
+$lines -join [Environment]::NewLine | Out-File -FilePath $Summary -Encoding UTF8
+
+Write-Host ""
+Write-Host "=== Summary ==="
+Write-Host ("Copied: {0} | Skipped: {1} | Failed: {2}" -f $copied, $skipped, $failed)
+
+# ---------------------------
+# Cleanup sensitive env vars (optional but recommended)
+# ---------------------------
+$env:AWS_ACCESS_KEY_ID     = $null
+$env:AWS_SECRET_ACCESS_KEY = $null
+# $env:AWS_DEFAULT_REGION = $null
+# $env:HTTPS_PROXY = $null
+# $env:HTTP_PROXY  = $null
+
+# ---------------------------
+# Exit with a proper code for the scheduler/wrapper
+# ---------------------------
+if ($failed -gt 0) {
+  exit 1
+} else {
+  exit 0
+}
