@@ -1,0 +1,687 @@
+
+<#
+    Convert AND restore all databases, with separate exclude lists for convert vs. restore.
+
+    - Purges any plain *.sql files (but NOT *.sql.gz nor *.sql.sql) before conversion, unless excluded from convert
+    - Converts .sql.gz/.sql.sql/.sql into normalized "<db>.sql" (header-aware gzip)
+    - Normalizes names: drops leading 'aurora', strips 'Backup-', stops at first digit token (date/time)
+      e.g., 'aurora-prod-finance-accounts-20251217-130349.sql.gz' -> '-prod-finance-accounts.sql'
+    - Skips conversion when normalized '<db>.sql' already exists (unless it was just purged)
+    - Restores each DB with a progress bar + periodic logs (PIPE to mysql stdin)
+    - Uses a single, quoted --init-command to remove NO_BACKSLASH_ESCAPES and disable FK checks
+    - Enables --binary-mode for safe import
+    - Optional live on-disk size polling from information_schema during restore
+    - **LOGGING**: Writes a plain-text daily log named 'ALL_DBS_YYYYMMDD.log' in F:\Dumps\logs_db_restore
+      with a header line 'ALL_DBS_YYYY-MM-DD :' per run, overall start/finish, per-DB start/finish/duration,
+      and Pass/Fail outcome. Multiple runs in the same day append with a separator.
+    - PowerShell 5.1 safe: no PS7-only operators, proper quoting, flat arg arrays
+
+    CHANGELOG (2026-01-14):
+      - Split exclusions into -ExcludeFromConvert and -ExcludeFromRestore
+      - Purge step now respects -ExcludeFromConvert so we don't delete a .sql we won't re-create
+      - Added log lines when conversion is skipped due to exclusions
+      - Default: Convert everything; Restore everything except 'rocs-ops' (matches previous behavior)
+#>
+
+param(
+    [string]$DumpDir = "F:\Dumps",
+    [switch]$Recurse = $false,
+
+    # mysql client
+    [string]$MySqlExe = "mysql",
+
+    # Auth choice: prefer --login-path if provided; else use --user/--password
+    [string]$LoginPath = "restore",
+    [string]$MySqlUser = "root",
+    [string]$MySqlPassword = "",
+
+    # DB creation defaults
+    [string]$DefaultCharset = "utf8mb4",
+    [string]$Collation = "utf8mb4_0900_ai_ci",
+
+    # Drop & recreate schema before import
+    [switch]$DropAndRecreate = $true,
+
+    # Restore progress logging granularity (log every N% progress)
+    [int]$ProgressLogPercent = 5,
+
+    # Timeout per DB (seconds)
+    [int]$WaitTimeoutSec = 3600,   # raise for huge dumps
+
+    # Client/network defaults
+    [string]$Protocol = "TCP",
+    [int]$ConnectTimeoutSec = 30,
+    [int]$MaxAllowedPacketMB = 1024,
+
+    # Live size polling interval (seconds); set 0 to disable (recommended for automation)
+    [int]$SizePollSec = 0,
+
+    # New: Separate exclusions
+    [string[]]$ExcludeFromConvert = @(),
+    [string[]]$ExcludeFromRestore = @()
+)
+
+function TS { Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
+function Write-Info([string]$msg) { Write-Host ("[{0}] {1}" -f (TS), $msg) }
+function Write-Warn([string]$msg) { Write-Host ("[{0}] [WARN] {1}" -f (TS), $msg) -ForegroundColor Yellow }
+function Write-Err ([string]$msg) { Write-Host ("[{0}] [ERROR] {1}" -f (TS), $msg) -ForegroundColor Red }
+
+# --- Plain-text LOGGING (daily per all DBs): ALL_DBS_yyyyMMdd.log ---
+$Global:LogFile = $null
+function Init-Logger([string]$DumpDir) {
+    try {
+        $logDir = Join-Path $DumpDir 'logs_db_restore'
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        
+        # File name: ALL_DBS_YYYYMMDD.log (one per day; append each run)
+        $dateStamp = Get-Date -Format 'yyyyMMdd'
+        $logPath   = Join-Path $logDir ("ALL_DBS_{0}.log" -f $dateStamp)
+        $Global:LogFile = $logPath
+
+        $runHeader = @(
+            "===== DB Restore Log =====",
+            ("ALL_DBS_{0} :" -f (Get-Date -Format 'yyyy-MM-dd')),  # Requested header format
+            ("Start: {0}" -f (TS)),
+            ("DumpDir: {0}" -f $DumpDir)
+        )
+
+        if (-not (Test-Path -LiteralPath $Global:LogFile)) {
+            # First log for the day -> create file
+            $runHeader | Out-File -FilePath $Global:LogFile -Encoding utf8 -Force
+        } else {
+            # Same-day subsequent run -> append with a separator
+            "------------------------------------------------------------" | Out-File -Append -FilePath $Global:LogFile -Encoding utf8
+            $runHeader | Out-File -Append -FilePath $Global:LogFile -Encoding utf8
+        }
+    } catch {
+        Write-Warn ("Logging initialization failed: {0}" -f $_.Exception.Message)
+        $Global:LogFile = $null
+    }
+}
+function Write-Log([string]$text) {
+    if ($Global:LogFile) { $text | Out-File -Append -FilePath $Global:LogFile -Encoding utf8 }
+}
+function Close-Logger() {
+    if ($Global:LogFile) { ("Finish: {0}" -f (TS)) | Out-File -Append -FilePath $Global:LogFile -Encoding utf8 }
+}
+
+# Coalesce (PS 5.1 safe)
+function Coalesce([string]$val, [string]$fallback) {
+    if ($null -eq $val -or $val -eq "") { return $fallback } else { return $val }
+}
+
+function Test-IsGzip([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    try {
+        $fs = [System.IO.File]::OpenRead($path)
+        try {
+            if ($fs.Length -lt 2) { return $false }
+            $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
+            return ($b1 -eq 0x1F -and $b2 -eq 0x8B)
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+}
+
+# Normalize filename to base '<db>' (strip ext, remove Backup-, drop leading 'aurora', stop at first digit token)
+function Get-NormalizedBase([string]$fileName) {
+    $base = $fileName
+    if     ($base.EndsWith(".sql.gz"))  { $base = $base.Substring(0, $base.Length - 7) }
+    elseif ($base.EndsWith(".sql.sql")) { $base = $base.Substring(0, $base.Length - 8) }
+    elseif ($base.EndsWith(".sql"))     { $base = $base.Substring(0, $base.Length - 4) }
+
+    if ($base.StartsWith("Backup-", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $base = $base.Substring(7)
+    }
+
+    $tokens = $base.Split('-') | Where-Object { $_ -ne "" }
+    $out = @()
+    foreach ($t in $tokens) {
+        if ($t -match '^\d') { break }
+        if ($out.Count -eq 0 -and $t -match '^(?i)aurora$') { continue }
+        $out += $t
+    }
+    if ($out.Count -eq 0) { throw "Could not normalize base name from '$fileName'." }
+    return ($out -join '-').ToLowerInvariant()
+}
+
+# Choose newest candidate preferring .sql.gz > .sql.sql > .sql
+function Select-BestSource([System.IO.FileInfo[]]$files) {
+    $groups = $files | Group-Object {
+        $n = $_.Name.ToLowerInvariant()
+        if     ($n.EndsWith(".sql.gz"))  { "gz" }
+        elseif ($n.EndsWith(".sql.sql")) { "double" }
+        elseif ($n.EndsWith(".sql"))     { "plain" }
+        else                                { "other" }
+    }
+
+    foreach ($g in $groups | Sort-Object {
+        switch ($_.Name) { "gz" {0} "double" {1} "plain" {2} default {99} }
+    }) {
+        if ($g.Name -eq "other") { continue }
+        return ($g.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    }
+    return $null
+}
+
+# Purge any plain .sql (NOT .sql.gz or .sql.sql) before conversion, unless excluded from convert
+function Remove-PlainSqlFiles([string]$Root, [switch]$Recurse, [string[]]$ExcludeBases = @()) {
+    $params = @{ Path = (Join-Path $Root '*'); File = $true }
+    if ($Recurse) { $params.Recurse = $true }
+    $all = Get-ChildItem @params -Include *.sql, *.sql.gz, *.sql.sql
+    if (-not $all) { return 0 }
+
+    $plain = $all | Where-Object { $_.Name.ToLowerInvariant().EndsWith('.sql') -and -not $_.Name.ToLowerInvariant().EndsWith('.sql.sql') }
+    $count = 0
+    foreach ($p in $plain) {
+        $baseNameOnly = [System.IO.Path]::GetFileNameWithoutExtension($p.Name).ToLowerInvariant()
+        if ($ExcludeBases -contains $baseNameOnly) {
+            Write-Info ("[purge] Skip purge (excluded from convert): '{0}'" -f $p.FullName)
+            Write-Log  ("[purge] Skip purge (excluded from convert): '{0}'" -f $p.FullName)
+            continue
+        }
+        try {
+            Write-Info ("[purge] Removing plain SQL: '{0}'" -f $p.FullName)
+            Write-Log  ("[purge] Removing plain SQL: '{0}'" -f $p.FullName)
+            Remove-Item -LiteralPath $p.FullName -Force -ErrorAction Stop
+            $count++
+        } catch {
+            Write-Warn ("[purge] Failed to remove '{0}': {1}" -f $p.FullName, $_.Exception.Message)
+            Write-Log  ("[purge] Failed to remove '{0}': {1}" -f $p.FullName, $_.Exception.Message)
+        }
+    }
+    Write-Info ("[purge] Removed {0} plain .sql file(s)." -f $count)
+    Write-Log  ("[purge] Removed {0} plain .sql file(s)." -f $count)
+    return $count
+}
+
+# Convert ALL dumps (excluding provided DBs) into normalized '<db>.sql'
+function Convert-AllDumps([System.IO.FileInfo[]]$files, [string[]]$exclude) {
+    $results = New-Object System.Collections.Generic.List[PSCustomObject]
+    $map = @{}
+
+    foreach ($f in $files) {
+        $db = $null
+        try { $db = Get-NormalizedBase $f.Name } catch { continue }
+        if ($exclude -contains $db) {
+            Write-Info ("[convert] Skip (excluded): '{0}' from file '{1}'" -f $db, $f.Name)
+            Write-Log  ("[convert] Skip (excluded): '{0}' from file '{1}'" -f $db, $f.Name)
+            continue
+        }
+        if (-not $map.ContainsKey($db)) { $map[$db] = New-Object System.Collections.Generic.List[System.IO.FileInfo] }
+        $map[$db].Add($f)
+    }
+
+    if ($map.Keys.Count -eq 0) {
+        Write-Warn "No convertible databases found (after exclusions)."
+        Write-Log  "No convertible databases found (after exclusions)."
+        return @()
+    }
+
+    foreach ($db in ($map.Keys | Sort-Object)) {
+        $cands = $map[$db]
+        $best  = Select-BestSource $cands
+        if (-not $best) {
+            Write-Warn "No usable source for '$db' (unsupported extensions)."
+            Write-Log  "No usable source for '$db' (unsupported extensions)."
+            $results.Add([pscustomobject]@{ DbName=$db; SqlPath=$null; SourceFile=$null; Action="none"; Success=$false; Error="No usable source" })
+            continue
+        }
+
+        $target = Join-Path $best.DirectoryName ("{0}.sql" -f $db)
+
+        if (Test-Path -LiteralPath $target) {
+            Write-Info ("[convert] Target exists, skip: '{0}' (src: {1})" -f $target, $best.FullName)
+            Write-Log  ("[convert] Target exists, skip: '{0}' (src: {1})" -f $target, $best.FullName)
+            $results.Add([pscustomobject]@{ DbName=$db; SqlPath=(Get-Item -LiteralPath $target).FullName; SourceFile=$best.FullName; Action="skip-existing"; Success=$true; Error=$null })
+            continue
+        }
+
+        try {
+            $bestName = $best.Name.ToLowerInvariant()
+            if ($bestName.EndsWith(".sql.gz")) {
+                if (Test-IsGzip -path $best.FullName) {
+                    Write-Info ("[convert] Decompress '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                    Write-Log  ("[convert] Decompress '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                    $inStream  = [System.IO.File]::OpenRead($best.FullName)
+                    try {
+                        $gzStream  = New-Object System.IO.Compression.GZipStream($inStream, [System.IO.Compression.CompressionMode]::Decompress)
+                        try {
+                            $outStream = [System.IO.File]::Open($target, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+                            try {
+                                $buffer = New-Object byte[] 81920
+                                while (($read = $gzStream.Read($buffer, 0, $buffer.Length)) -gt 0) { $outStream.Write($buffer, 0, $read) }
+                            } finally { $outStream.Dispose() }
+                        } finally { $gzStream.Dispose() }
+                    } finally { $inStream.Dispose() }
+                    Write-Info "[convert] Decompressed."
+                    Write-Log  "[convert] Decompressed."
+                    $results.Add([pscustomobject]@{ DbName=$db; SqlPath=(Get-Item -LiteralPath $target).FullName; SourceFile=$best.FullName; Action="decompressed"; Success=$true; Error=$null })
+                } else {
+                    Write-Warn ("[convert] Header not gzip; copying as SQL '{0}' -> '{1}'." -f $best.FullName, $target)
+                    Write-Log  ("[convert] Header not gzip; copying as SQL '{0}' -> '{1}'." -f $best.FullName, $target)
+                    Copy-Item -LiteralPath $best.FullName -Destination $target -Force
+                    $results.Add([pscustomobject]@{ DbName=$db; SqlPath=(Get-Item -LiteralPath $target).FullName; SourceFile=$best.FullName; Action="copied"; Success=$true; Error=$null })
+                }
+            }
+            elseif ($bestName.EndsWith(".sql.sql")) {
+                Write-Info ("[convert] Rename '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                Write-Log  ("[convert] Rename '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+                Rename-Item -LiteralPath $best.FullName -NewName ([System.IO.Path]::GetFileName($target))
+                $results.Add([pscustomobject]@{ DbName=$db; SqlPath=(Get-Item -LiteralPath $target).FullName; SourceFile=$best.FullName; Action="renamed"; Success=$true; Error=$null })
+            }
+            elseif ($bestName.EndsWith(".sql")) {
+                Write-Info ("[convert] Copy '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                Write-Log  ("[convert] Copy '{0}' -> '{1}' ..." -f $best.FullName, $target)
+                Copy-Item -LiteralPath $best.FullName -Destination $target -Force
+                $results.Add([pscustomobject]@{ DbName=$db; SqlPath=(Get-Item -LiteralPath $target).FullName; SourceFile=$best.FullName; Action="copied"; Success=$true; Error=$null })
+            }
+            else {
+                throw "Unsupported source extension for '$($best.FullName)'."
+            }
+        } catch {
+            Write-Err ("[convert] Failed for '{0}': {1}" -f $db, $_.Exception.Message)
+            Write-Log ("[convert] Failed for '{0}': {1}" -f $db, $_.Exception.Message)
+            $results.Add([pscustomobject]@{ DbName=$db; SqlPath=$null; SourceFile=$best.FullName; Action="failed"; Success=$false; Error=$_.Exception.Message })
+        }
+    }
+
+    return @($results)
+}
+
+# Connectivity test
+function Test-MySqlConnectivity([string]$MySqlExe, [string]$LoginPath, [string]$Protocol, [int]$ConnectTimeoutSec, [string]$MySqlUser, [string]$MySqlPassword) {
+    Write-Info "Testing MySQL connectivity ..."
+    Write-Log  "Testing MySQL connectivity ..."
+    $args = @()
+    if ($LoginPath -and $LoginPath -ne "") { $args += "--login-path=$LoginPath" }
+    else {
+        if ($MySqlUser -and $MySqlUser -ne "") { $args += "--user=$MySqlUser" }
+        if ($MySqlPassword -and $MySqlPassword -ne "") { $args += ("--password={0}" -f $MySqlPassword) }
+    }
+    if ($Protocol -and $Protocol -ne "") { $args += "--protocol=$Protocol" }
+    if ($ConnectTimeoutSec -gt 0)        { $args += "--connect-timeout=$ConnectTimeoutSec" }
+    $args += "-e"; $args += "SELECT USER() AS user, @@hostname AS host, @@version AS version, @@version_comment AS comment;"
+
+    & $MySqlExe @args | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "mysql client returned ExitCode=$LASTEXITCODE during connectivity test." }
+    Write-Info "MySQL connectivity OK."
+    Write-Log  "MySQL connectivity OK."
+}
+
+# Print ~60 lines around a failing line number from a .sql file
+function Show-SqlErrorContext([string]$SqlPath, [int]$LineNumber, [int]$Radius = 30) {
+    if (-not (Test-Path -LiteralPath $SqlPath)) { Write-Host "File not found: $SqlPath" -ForegroundColor Red; return }
+    $sr = New-Object System.IO.StreamReader($SqlPath)
+    try {
+        $cur = 0; $start = [Math]::Max($LineNumber - $Radius, 1); $end = $LineNumber + $Radius
+        while (-not $sr.EndOfStream) {
+            $line = $sr.ReadLine(); $cur++
+            if ($cur -lt $start) { continue }
+            if ($cur -gt $end)   { break }
+            $prefix = if ($cur -eq $LineNumber) { ">>" } else { "  " }
+            Write-Host ("{0} {1,6}: {2}" -f $prefix, $cur, $line)
+        }
+    } finally { $sr.Dispose() }
+}
+
+# Query actual on-disk size for a schema
+function Get-DbSizeMb([string]$MySqlExe, [string]$LoginPath, [string]$User, [string]$Pass, [string]$DbName, [string]$Protocol, [int]$ConnectTimeoutSec) {
+    $args = @()
+    if ($LoginPath -and $LoginPath -ne "") { $args += "--login-path=$LoginPath" } else {
+        if ($User -and $User -ne "") { $args += "--user=$User" }
+        if ($Pass -and $Pass -ne "") { $args += ("--password={0}" -f $Pass) }
+    }
+    if ($Protocol -and $Protocol -ne "") { $args += "--protocol=$Protocol" }
+    if ($ConnectTimeoutSec -gt 0)        { $args += "--connect-timeout=$ConnectTimeoutSec" }
+    $qry = @"
+SELECT ROUND(SUM(DATA_LENGTH)/1024/1024,2) AS data_mb,
+       ROUND(SUM(INDEX_LENGTH)/1024/1024,2) AS index_mb,
+       ROUND(SUM(DATA_LENGTH+INDEX_LENGTH)/1024/1024,2) AS total_mb
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = '$DbName';
+"@
+    $out = & $MySqlExe $args -N -e $qry
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+    $p = $out -split '\s+'
+    return [pscustomobject]@{ Db=$DbName; DataMB=[double]$p[0]; IndexMB=[double]$p[1]; TotalMB=[double]$p[2] }
+}
+
+# Restore one DB with PIPE progress and robust error/context reporting
+function Import-MySqlWithProgress(
+    [string]$MySqlExe, [string]$LoginPath, [string]$MySqlUser, [string]$MySqlPassword,
+    [string]$DefaultCharset, [string]$DbName, [string]$InitCmd, [string]$SqlPath,
+    [int]$ProgressLogPercent, [int]$WaitTimeoutSec,
+    [string]$Protocol, [int]$ConnectTimeoutSec, [int]$MaxAllowedPacketMB,
+    [int]$SizePollSec
+) {
+    if (-not (Test-Path -LiteralPath $SqlPath)) { throw "SQL file not found: $SqlPath" }
+
+    $start = Get-Date
+    $fileInfo = Get-Item -LiteralPath $SqlPath
+    $totalBytes = $fileInfo.Length
+    $totalMB = [Math]::Round(($totalBytes / 1MB), 2)
+
+    Write-Info ("Begin restore '{0}' from '{1}' (Size: {2} MB)" -f $DbName, $SqlPath, $totalMB)
+    Write-Log  ("Begin restore '{0}' from '{1}' (Size: {2} MB)" -f $DbName, $SqlPath, $totalMB)
+
+    # --- Build mysql args safely ---
+    $args = @()
+    if ($LoginPath -and $LoginPath -ne "") {
+        $args += "--login-path=$LoginPath"
+    } else {
+        if ($MySqlUser -and $MySqlUser -ne "") { $args += "--user=$MySqlUser" }
+        if ($MySqlPassword -and $MySqlPassword -ne "") { $args += ("--password={0}" -f $MySqlPassword) }
+    }
+    if ($DefaultCharset -and $DefaultCharset -ne "") { $args += "--default-character-set=$DefaultCharset" }
+    $args += "--binary-mode"
+    $args += "-D"; $args += $DbName
+    if ($InitCmd -and $InitCmd -ne "") { $args += ('--init-command="{0}"' -f $InitCmd) }
+    if ($Protocol -and $Protocol -ne "") { $args += "--protocol=$Protocol" }
+    if ($ConnectTimeoutSec -gt 0)        { $args += "--connect-timeout=$ConnectTimeoutSec" }
+    if ($MaxAllowedPacketMB -gt 0)       { $args += "--max-allowed-packet=$($MaxAllowedPacketMB)M" }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $MySqlExe
+    $psi.Arguments = ($args -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if (-not $proc) { throw "Failed to start process '$MySqlExe'." }
+
+    # Optional live DB size polling
+    $pollTimer = $null
+    if ($SizePollSec -gt 0) {
+        $pollTimer = New-Object Timers.Timer
+        $pollTimer.Interval = [Math]::Max($SizePollSec * 1000, 3000)
+        $pollTimer.AutoReset = $true
+        $pollTimer.add_Elapsed({
+            try {
+                $sizeArgs = @()
+                if ($LoginPath -and $LoginPath -ne "") { $sizeArgs += "--login-path=$LoginPath" } else {
+                    if ($MySqlUser -and $MySqlUser -ne "") { $sizeArgs += "--user=$MySqlUser" }
+                    if ($MySqlPassword -and $MySqlPassword -ne "") { $sizeArgs += ("--password={0}" -f $MySqlPassword) }
+                }
+                if ($Protocol -and $Protocol -ne "") { $sizeArgs += "--protocol=$Protocol" }
+                if ($ConnectTimeoutSec -gt 0)        { $sizeArgs += "--connect-timeout=$ConnectTimeoutSec" }
+                $qry = @"
+SELECT ROUND(SUM(DATA_LENGTH)/1024/1024,2) AS data_mb,
+       ROUND(SUM(INDEX_LENGTH)/1024/1024,2) AS index_mb,
+       ROUND(SUM(DATA_LENGTH+INDEX_LENGTH)/1024/1024,2) AS total_mb
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = '$DbName';
+"@
+                $out = & $MySqlExe $sizeArgs -N -e $qry
+                if ($LASTEXITCODE -eq 0 -and $out) {
+                    $parts = $out -split '\s+'
+                    if ($parts.Count -ge 3) {
+                        $dataMb  = [double]$parts[0]
+                        $indexMb = [double]$parts[1]
+                        $totalMb = [double]$parts[2]
+                        Write-Info ("[size] '{0}' data={1} MB, index={2} MB, total={3} MB" -f $DbName, $dataMb, $indexMb, $totalMb)
+                        Write-Log  ("[size] '{0}' data={1} MB, index={2} MB, total={3} MB" -f $DbName, $dataMb, $indexMb, $totalMb)
+                    }
+                }
+            } catch { }
+        })
+        $pollTimer.Start()
+    }
+
+    # Stream file to mysql stdin with early-exit guard
+    $fs = [System.IO.File]::OpenRead($SqlPath)
+    $buffer = New-Object byte[] (1024 * 1024)
+    $sentBytes = 0
+    $nextLogPercent = $ProgressLogPercent
+    try {
+        if ($totalBytes -le 0) {
+            Write-Info "SQL file '$SqlPath' is 0 bytes; sending empty input."
+            Write-Log  "SQL file '$SqlPath' is 0 bytes; sending empty input."
+        } else {
+            while (($read = $fs.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                if ($proc.HasExited) {
+                    $stderrSnap = ""; try { $stderrSnap = $proc.StandardError.ReadToEnd() } catch {}
+                    throw "mysql exited early (ExitCode=$($proc.ExitCode)). Err: $stderrSnap"
+                }
+                $proc.StandardInput.BaseStream.Write($buffer, 0, $read)
+                $proc.StandardInput.BaseStream.Flush()
+                $sentBytes += $read
+
+                $pct = [Math]::Round(($sentBytes / [double]$totalBytes) * 100, 1)
+                if ($pct -ge $nextLogPercent) {
+                    $msg = ("Restore '{0}' progress: {1}% ({2}/{3} MB)" -f $DbName, $pct, ([Math]::Round($sentBytes/1MB,2)), $totalMB)
+                    Write-Info $msg
+                    Write-Log  $msg
+                    $nextLogPercent += $ProgressLogPercent
+                }
+            }
+        }
+    } finally {
+        try { $fs.Dispose() } catch {}
+        try { $proc.StandardInput.Close() } catch {}
+    }
+
+    if (-not $proc.WaitForExit($WaitTimeoutSec * 1000)) {
+        Write-Info "mysql did not exit within $WaitTimeoutSec seconds. Killing process…"
+        Write-Log  "mysql did not exit within $WaitTimeoutSec seconds. Killing process…"
+        try { $proc.Kill() } catch {}
+        if ($pollTimer) { $pollTimer.Stop(); $pollTimer.Dispose() }
+        throw "Timeout: mysql did not complete for '$DbName'."
+    }
+
+    if ($pollTimer) { $pollTimer.Stop(); $pollTimer.Dispose() }
+
+    $stderr = ""; $stdout = ""
+    try { $stderr = $proc.StandardError.ReadToEnd() } catch {}
+    try { $stdout = $proc.StandardOutput.ReadToEnd() } catch {}
+
+    $end = Get-Date
+    $duration = $end - $start
+    $secs = [Math]::Max([Math]::Round($duration.TotalSeconds, 2), 0.01)
+    $mbps = if ($secs -gt 0) { [Math]::Round($totalMB / $secs, 2) } else { 0 }
+
+    if ($proc.ExitCode -eq 0) {
+        $okMsg = ("[OK] '{0}' restored. Duration: {1:mm\:ss} (≈{2} MB, {3} MB/s)" -f $DbName, $duration, $totalMB, $mbps)
+        Write-Info $okMsg
+        Write-Log  $okMsg
+    } else {
+        $errLine = $null
+        if ($stderr -match 'at line\s+(\d+)') { $errLine = [int]$Matches[1] }
+        $msg = "Restore failed for '$DbName' (ExitCode=$($proc.ExitCode))."
+        if ($stderr) {
+            $lines = ($stderr -split "`r?`n") | Where-Object { $_ -ne "" }
+            if ($lines.Count -gt 0) {
+                $preview = ($lines | Select-Object -First 3) -join " | "
+                $msg = "$msg Err: $preview"
+            }
+        }
+        Write-Err $msg
+        Write-Log  $msg
+        if ($errLine) {
+            Write-Info ("Showing SQL around line {0} in '{1}' ..." -f $errLine, $SqlPath)
+            Write-Log  ("Showing SQL around line {0} in '{1}' ..." -f $errLine, $SqlPath)
+            Show-SqlErrorContext -SqlPath $SqlPath -LineNumber $errLine -Radius 30
+        }
+        throw $msg
+    }
+}
+
+# --- Main ---
+
+if (-not (Test-Path -Path $DumpDir)) { throw "DumpDir not found: $DumpDir" }
+
+Init-Logger -DumpDir $DumpDir
+
+# Pre-flight connectivity
+Test-MySqlConnectivity -MySqlExe $MySqlExe -LoginPath $LoginPath -Protocol $Protocol -ConnectTimeoutSec $ConnectTimeoutSec `
+                       -MySqlUser $MySqlUser -MySqlPassword $MySqlPassword
+
+# Gather candidate files
+$gciParams = @{ Path = (Join-Path $DumpDir '*'); File = $true }
+if ($Recurse) { $gciParams.Recurse = $true }
+
+$initialFiles = Get-ChildItem @gciParams -Include *.sql, *.sql.gz, *.sql.sql | Sort-Object FullName
+
+# Purge plain .sql first (but keep bases excluded from convert)
+Write-Info ("Excluding from CONVERT (affects purge & convert): {0}" -f ([string]::Join(", ", $ExcludeFromConvert)))
+Write-Log  ("Excluding from CONVERT (affects purge & convert): {0}" -f ([string]::Join(", ", $ExcludeFromConvert)))
+
+$removed = Remove-PlainSqlFiles -Root $DumpDir -Recurse:$Recurse -ExcludeBases $ExcludeFromConvert
+if ($removed -gt 0) {
+    # Rebuild file list after purge
+    $initialFiles = Get-ChildItem @gciParams -Include *.sql, *.sql.gz, *.sql.sql | Sort-Object FullName
+}
+
+if ($initialFiles.Count -eq 0) { Write-Info "No dump files found in $DumpDir (Recurse=$Recurse)."; Write-Log "No dump files found."; Close-Logger; exit 0 }
+
+# Convert (excluding ExcludeFromConvert)
+$converted = @(Convert-AllDumps -files $initialFiles -exclude $ExcludeFromConvert)
+if ($converted.Count -eq 0) { Write-Warn "Nothing converted (after exclusions). Exiting."; Write-Log "Nothing converted (after exclusions)."; Close-Logger; exit 0 }
+
+Write-Info "Normalized/converted .sql files:"
+Write-Log  "Normalized/converted .sql files:"
+$converted | Where-Object { $_.Success -and $_.SqlPath } | Sort-Object DbName | ForEach-Object {
+    $line = " - {0} -> {1} (src: {2}, action: {3})" -f $_.DbName, $_.SqlPath, $_.SourceFile, $_.Action
+    Write-Info $line
+    Write-Log  $line
+}
+
+$convertedOk = @($converted | Where-Object { $_.Success -and $_.SqlPath })
+$failConv    = @($converted | Where-Object { -not $_.Success -or -not $_.SqlPath })
+
+foreach ($fc in $failConv) {
+    $errMsg = (Coalesce $fc.Error "unknown")
+    Write-Warn ("[missing/failed] {0}: {1}" -f $fc.DbName, $errMsg)
+    Write-Log  ("[missing/failed] {0}: {1}" -f $fc.DbName, $errMsg)
+}
+
+# Restore loop with per-DB timing + outcome logging
+Write-Info ("Excluding from RESTORE: {0}" -f ([string]::Join(", ", $ExcludeFromRestore)))
+Write-Log  ("Excluding from RESTORE: {0}" -f ([string]::Join(", ", $ExcludeFromRestore)))
+
+$bt = [char]96
+$restored    = New-Object System.Collections.Generic.List[PSCustomObject]
+$restoreErrs = New-Object System.Collections.Generic.List[PSCustomObject]
+
+foreach ($job in ($convertedOk | Sort-Object DbName)) {
+    $db = $job.DbName
+
+    if ($ExcludeFromRestore -contains $db) {
+        Write-Info ("[restore] Skip (excluded): '{0}'" -f $db)
+        Write-Log  ("[restore] Skip (excluded): '{0}'" -f $db)
+        continue
+    }
+
+    $sqlPath = $job.SqlPath
+
+    $dbStart = Get-Date
+    Write-Log ("[db-start] {0} at {1}" -f $db, (TS))
+
+    try {
+        if ($DropAndRecreate) {
+            $ddl = "DROP DATABASE IF EXISTS $bt$db$bt; CREATE DATABASE $bt$db$bt CHARACTER SET $DefaultCharset COLLATE $Collation;"
+            Write-Info ("Drop & create '{0}' ..." -f $db)
+            Write-Log  ("Drop & create '{0}' ..." -f $db)
+
+            $ddlArgs = @()
+            if ($LoginPath -and $LoginPath -ne "") { $ddlArgs += "--login-path=$LoginPath" } else {
+                if ($MySqlUser -and $MySqlUser -ne "") { $ddlArgs += "--user=$MySqlUser" }
+                if ($MySqlPassword -and $MySqlPassword -ne "") { $ddlArgs += ("--password={0}" -f $MySqlPassword) }
+            }
+            if ($Protocol -and $Protocol -ne "") { $ddlArgs += "--protocol=$Protocol" }
+            if ($ConnectTimeoutSec -gt 0)        { $ddlArgs += "--connect-timeout=$ConnectTimeoutSec" }
+            if ($DefaultCharset -and $DefaultCharset -ne "") { $ddlArgs += "--default-character-set=$DefaultCharset" }
+
+            & $MySqlExe $ddlArgs -e $ddl
+            if ($LASTEXITCODE -ne 0) { throw "Failed to (re)create database '$db' (ExitCode=$LASTEXITCODE)" }
+        }
+
+        Write-Info ("Starting restore with progress for '{0}' ..." -f $db)
+        Write-Log  ("Starting restore with progress for '{0}' ..." -f $db)
+
+        # Single statement so --init-command applies reliably
+        $initCmd = "SET SESSION sql_mode=REPLACE(@@SESSION.sql_mode,'NO_BACKSLASH_ESCAPES',''), FOREIGN_KEY_CHECKS=0;"
+
+        Import-MySqlWithProgress -MySqlExe $MySqlExe -LoginPath $LoginPath -MySqlUser $MySqlUser -MySqlPassword $MySqlPassword `
+                                 -DefaultCharset $DefaultCharset -DbName $db -InitCmd $initCmd -SqlPath $sqlPath `
+                                 -ProgressLogPercent $ProgressLogPercent -WaitTimeoutSec $WaitTimeoutSec `
+                                 -Protocol $Protocol -ConnectTimeoutSec $ConnectTimeoutSec -MaxAllowedPacketMB $MaxAllowedPacketMB `
+                                 -SizePollSec $SizePollSec
+
+        $restored.Add([pscustomobject]@{ DbName = $db; Sql = $sqlPath })
+
+        # Final on-disk size summary
+        $size = Get-DbSizeMb -MySqlExe $MySqlExe -LoginPath $LoginPath -User $MySqlUser -Pass $MySqlPassword -DbName $db -Protocol $Protocol -ConnectTimeoutSec $ConnectTimeoutSec
+        if ($size) {
+            $sizeLine = ("[final-size] {0}: data={1} MB, index={2} MB, total={3} MB" -f $size.Db, $size.DataMB, $size.IndexMB, $size.TotalMB)
+            Write-Info $sizeLine
+            Write-Log  $sizeLine
+        }
+
+        $dbEnd = Get-Date
+        $dbDur = ($dbEnd - $dbStart)
+        Write-Log ("[db-finish] {0} at {1}; Duration: {2:mm\:ss}; Outcome: PASS" -f $db, (TS), $dbDur)
+    } catch {
+        $errMsg = (Coalesce $_.Exception.Message "unknown error")
+        Write-Err ("Restore failed for '{0}': {1}" -f $db, $errMsg)
+        Write-Log ("[db-error] {0}: {1}" -f $db, $errMsg)
+        $restoreErrs.Add([pscustomobject]@{ DbName=$db; Sql=$sqlPath; Error=$errMsg })
+        $dbEnd = Get-Date
+        $dbDur = ($dbEnd - $dbStart)
+        Write-Log ("[db-finish] {0} at {1}; Duration: {2:mm\:ss}; Outcome: FAIL" -f $db, (TS), $dbDur)
+    }
+}
+
+# --- Summary ---
+Write-Host ""
+Write-Host "======================== Summary ========================" -ForegroundColor Cyan
+Write-Info ("Excluded from CONVERT : {0}" -f ([string]::Join(", ", $ExcludeFromConvert)))
+Write-Info ("Excluded from RESTORE : {0}" -f ([string]::Join(", ", $ExcludeFromRestore)))
+Write-Info ("Converted (ok)        : {0}" -f ($convertedOk.Count))
+Write-Info ("Conversion failed     : {0}" -f ($failConv.Count))
+Write-Info ("Restored (ok)         : {0}" -f ($restored.Count))
+Write-Info ("Restore failures      : {0}" -f ($restoreErrs.Count))
+
+Write-Log  ("Excluded from CONVERT : {0}" -f ([string]::Join(", ", $ExcludeFromConvert)))
+Write-Log  ("Excluded from RESTORE : {0}" -f ([string]::Join(", ", $ExcludeFromRestore)))
+Write-Log  ("Converted (ok)        : {0}" -f ($convertedOk.Count))
+Write-Log  ("Conversion failed     : {0}" -f ($failConv.Count))
+Write-Log  ("Restored (ok)         : {0}" -f ($restored.Count))
+Write-Log  ("Restore failures      : {0}" -f ($restoreErrs.Count))
+
+if ($failConv.Count -gt 0) {
+    Write-Host " - Missing/failed conversions:" -ForegroundColor Yellow
+    Write-Log  " - Missing/failed conversions:"
+    foreach ($fc in $failConv) {
+        $errMsg = (Coalesce $fc.Error "unknown")
+        Write-Host ("   - {0} : {1}" -f $fc.DbName, $errMsg)
+        Write-Log  ("   - {0} : {1}" -f $fc.DbName, $errMsg)
+    }
+}
+
+if ($restoreErrs.Count -gt 0) {
+    Write-Host " - Restore errors:" -ForegroundColor Yellow
+    Write-Log  " - Restore errors:"
+    foreach ($re in $restoreErrs) {
+        $errMsg = (Coalesce $re.Error "unknown")
+        Write-Host ("   - {0} : {1}" -f $re.DbName, $errMsg)
+        Write-Log  ("   - {0} : {1}" -f $re.DbName, $errMsg)
+    }
+}
+
+# --- Finalize logging and exit with a meaningful code for scheduler/wrapper ---
+$overallFail = ($failConv.Count -gt 0 -or $restoreErrs.Count -gt 0)
+
+$outcome = if ($overallFail) { "FAIL" } else { "PASS" }
+Write-Log ("Outcome           : {0}" -f $outcome)
+
+Close-Logger
+
+if ($overallFail) {
+    exit 1   # non-zero exit code signals failure to Task Scheduler / wrapper
+} else {
+    exit 0   # zero exit code signals success; next script can start
+}
